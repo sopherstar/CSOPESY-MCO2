@@ -1,0 +1,1 @@
+The range of instruction length per process can be set through the “config.txt.” Instruction types are randomized.
