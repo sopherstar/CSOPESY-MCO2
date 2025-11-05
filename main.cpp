@@ -13,6 +13,26 @@ using namespace std;
 #include <queue>
 #include <mutex>
 #include <unordered_map>
+#include <fstream>
+#include <algorithm>
+
+// default configuration settings, loaded from config.txt
+struct Config {
+    int num_cpu = 4;
+    std::string scheduler = "rr";
+    int quantum_cycles = 5;
+    long batch_process_freq = 1;
+    long min_ins = 1000;
+    long max_ins = 2000;
+    long delay_per_exec = 0;
+};
+
+// global configuration
+Config g_config;
+
+std::atomic<int> g_cpu_cycles{0};
+std::queue<int> g_ready_queue;
+std::mutex g_ready_queue_mtx;
 
 // shared state
 bool is_initialized = false;
@@ -67,11 +87,22 @@ struct PseudoProcess {
     uint8_t sleep_left{0};
     std::vector<Instruction> program;
     std::unordered_map<std::string, uint16_t> mem;
+
+    std::vector<std::string> log; // For PRINT instruction
+
+    // Stack for FOR loops
+    struct LoopFrame {
+        size_t for_instr_pc; // The index (in p.program) of the FOR_ instruction
+        size_t body_pc;      // The current index within the FOR_ body
+        uint32_t repeats_left;
+    };
+    std::vector<LoopFrame> loop_stack;
 };
 
 std::vector<PseudoProcess> g_processes;
 std::mutex g_processes_mtx;
 int g_next_pid = 1;
+
 
 static inline uint16_t clamp_u16(int32_t x) {
     if (x < 0) return 0;
@@ -129,6 +160,181 @@ static std::vector<Instruction> make_default_program(const std::string& pname) {
 
 //report utilization TO-DO: create this
 
+// Enum to signal the result of an instruction
+enum class ExecStatus { OK, SLEEP, FINISHED };
+
+// helper function to execute instructions
+ExecStatus execute_instruction(PseudoProcess& p, Instruction& instr) {
+    
+    switch (instr.type) {
+        case InstrType::PRINT: {
+            // Check for variable printing, e.g., PRINT ("Value from: " +x)
+            size_t var_pos = instr.msg.find("+x");
+            if (var_pos != std::string::npos && instr.msg.find("\"") < var_pos) {
+                 // Found "..." +x
+                 std::string base_msg = instr.msg.substr(0, var_pos);
+                 // Clean up quotes and " +"
+                 base_msg.erase(std::remove(base_msg.begin(), base_msg.end(), '"'), base_msg.end());
+                 if (base_msg.size() > 2 && base_msg.substr(base_msg.size() - 2) == " +") {
+                    base_msg = base_msg.substr(0, base_msg.size() - 2);
+                 }
+
+                 uint16_t val = read_val(p, "x", false, 0); // Spec example hardcodes 'x'
+                 p.log.push_back(base_msg + std::to_string(val));
+            } else {
+                 // Simple print, e.g. "Hello World"
+                 std::string clean_msg = instr.msg;
+                 clean_msg.erase(std::remove(clean_msg.begin(), clean_msg.end(), '"'), clean_msg.end());
+                 p.log.push_back(clean_msg);
+            }
+            break;
+        }
+
+        case InstrType::DECLARE:
+            p.mem[instr.var] = instr.value;
+            break;
+
+        case InstrType::ADD: {
+            uint16_t val2 = read_val(p, instr.var2, instr.var2_is_literal, instr.lit2);
+            uint16_t val3 = read_val(p, instr.var3, instr.var3_is_literal, instr.lit3);
+            // Auto-declare var1
+            read_val(p, instr.var1, false, 0); 
+            p.mem[instr.var1] = clamp_u16(val2 + val3);
+            break;
+        }
+
+        case InstrType::SUBTRACT: {
+            uint16_t val2 = read_val(p, instr.var2, instr.var2_is_literal, instr.lit2);
+            uint16_t val3 = read_val(p, instr.var3, instr.var3_is_literal, instr.lit3);
+            // Auto-declare var1
+            read_val(p, instr.var1, false, 0);
+            p.mem[instr.var1] = clamp_u16(val2 - val3);
+            break;
+        }
+
+        case InstrType::SLEEP:
+            p.sleep_left = instr.sleep_ticks;
+            return ExecStatus::SLEEP; // Signal to scheduler
+
+        case InstrType::FOR_:
+            // handled by core function
+            break;
+    }
+    return ExecStatus::OK;
+}
+
+// CPU thread function
+void cpu_core_function(int core_id) {
+    while (is_running) {
+        // get process id from ready queue
+        int pid_to_run = -1;
+        {
+            std::lock_guard<std::mutex> lk(g_ready_queue_mtx);
+            if (!g_ready_queue.empty()) {
+                pid_to_run = g_ready_queue.front();
+                g_ready_queue.pop();
+            }
+        }
+
+        if (pid_to_run == -1) {
+            // if no work to do, sleep and try again
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+        
+        std::lock_guard<std::mutex> lk(g_processes_mtx);
+        
+        // find process
+        PseudoProcess* p = nullptr;
+        for (auto& proc : g_processes) {
+            if (proc.pid == pid_to_run) {
+                p = &proc;
+                break;
+            }
+        }
+
+        // if process not found or already running/finished, skip
+        if (p == nullptr || p->finished || p->running) {
+            continue;
+        }
+
+        p->running = true;
+        
+        bool process_finished = false;
+        bool process_sleeping = false;
+        
+        // get quantum
+        int quantum = (g_config.scheduler == "rr") ? g_config.quantum_cycles : 1000;
+
+        for (int i = 0; i < quantum; ++i) {
+            if (g_config.delay_per_exec > 0) {
+                // simulate delay
+                std::this_thread::sleep_for(std::chrono::milliseconds(g_config.delay_per_exec));
+            }
+
+            // get instruction
+            Instruction* instr_to_exec = nullptr;
+
+            if (!p->loop_stack.empty()) {
+                // for loop
+                auto& loop = p->loop_stack.back();
+                Instruction& for_instr = p->program[loop.for_instr_pc];
+                if (loop.body_pc >= for_instr.body.size()) {
+                    loop.repeats_left--;
+                    loop.body_pc = 0;
+                    if (loop.repeats_left == 0) {
+                        p->loop_stack.pop_back();
+                        p->pc = loop.for_instr_pc + 1;
+                    }
+                    continue; 
+                }
+                instr_to_exec = &for_instr.body[loop.body_pc];
+                loop.body_pc++;
+            } else {
+                if (p->pc >= p->program.size()) {
+                    process_finished = true;
+                    break;
+                }
+                
+                instr_to_exec = &p->program[p->pc];
+
+                if (instr_to_exec->type == InstrType::FOR_) {
+                    if (instr_to_exec->repeats > 0) {
+                        p->loop_stack.push_back({p->pc, 0, instr_to_exec->repeats});
+                    }
+                    p->pc++;
+                    continue; 
+                }
+                
+                p->pc++;
+            }
+
+            if (process_finished) break;
+
+            // execute instruction
+            ExecStatus status = execute_instruction(*p, *instr_to_exec);
+            if (status == ExecStatus::SLEEP) {
+                process_sleeping = true;
+                break;
+            }
+        }
+
+        if (process_finished) {
+            p->running = false;
+            p->finished = true;
+        } 
+        else if (process_sleeping) {
+            // running stays true if process is sleeping
+        } 
+        else {
+            // quantum expired, put back in ready queue
+            p->running = false;
+            std::lock_guard<std::mutex> lk_ready(g_ready_queue_mtx);
+            g_ready_queue.push(p->pid);
+        }
+    }
+}
+
 // Command interpreter
 void command_interpreter_thread(string input) {
     vector<string> tokens = tokenize_input(input);
@@ -144,15 +350,74 @@ void command_interpreter_thread(string input) {
         return;
     }
 
-    // initialize before anything else
+// initialize before anything else
     if (cmd == "initialize") {
         if (is_initialized) {
             cout << "Already initialized.\n";
             return;
         }
 
+        std::ifstream config_file("config.txt");
+        if (!config_file.is_open()) {
+            cout << "Error: config.txt not found. Cannot initialize.\n";
+            return;
+        }
+
+        std::string line;
+        std::string key;
+        std::string value_str;
+
+        while (std::getline(config_file, line)) {
+            std::istringstream iss(line);
+            if (!(iss >> key >> value_str)) {
+                // skip whitespace
+                continue;
+            }
+
+            try {
+                if (key == "num-cpu") {
+                    g_config.num_cpu = std::stoi(value_str);
+                } else if (key == "scheduler") {
+                    // remove quotes from "rr" or "fcfs"
+                    if (value_str.front() == '"') value_str.erase(0, 1);
+                    if (value_str.back() == '"') value_str.pop_back();
+                    g_config.scheduler = value_str;
+                } else if (key == "quantum-cycles") {
+                    g_config.quantum_cycles = std::stoi(value_str);
+                } else if (key == "batch-process-freq") {
+                    g_config.batch_process_freq = std::stol(value_str);
+                } else if (key == "min-ins") {
+                    g_config.min_ins = std::stol(value_str);
+                } else if (key == "max-ins") {
+                    g_config.max_ins = std::stol(value_str);
+                } else if (key == "delay-per-exec") {
+                    g_config.delay_per_exec = std::stol(value_str);
+                }
+            } catch (const std::exception& e) {
+                cout << "Error parsing config line: " << line << "\n";
+            }
+        }
+        config_file.close();
+
         is_initialized = true;
         cout << "System initialized.\n";
+
+        // show configuration summary
+        cout << "  - num-cpu: " << g_config.num_cpu << "\n";
+        cout << "  - scheduler: " << g_config.scheduler << "\n";
+        cout << "  - quantum-cycles: " << g_config.quantum_cycles << "\n";
+        cout << "  - batch-process-freq: " << g_config.batch_process_freq << "\n";
+        cout << "  - min-ins: " << g_config.min_ins << "\n";
+        cout << "  - max-ins: " << g_config.max_ins << "\n";
+        cout << "  - delay-per-exec: " << g_config.delay_per_exec << "\n";
+        
+        // launch cpu threads
+        cout << "Launching " << g_config.num_cpu << " CPU cores...\n";
+        for (int i = 0; i < g_config.num_cpu; ++i) {
+            std::thread(cpu_core_function, i).detach();
+        }
+        cout << "CPU cores running.\n";
+        
         return;
     }
 
@@ -221,6 +486,10 @@ void command_interpreter_thread(string input) {
             	g_processes.push_back(std::move(proc));
         	}
 
+            {
+                std::lock_guard<std::mutex> lk(g_ready_queue_mtx);
+                g_ready_queue.push(g_next_pid - 1);
+            }
         	cout << "Started process \"" << pname << "\" with PID " << (g_next_pid - 1) << ".\n";
         	return;
     	}
@@ -238,6 +507,48 @@ void command_interpreter_thread(string input) {
     }
     else {
         cout << "Unknown command. Type \"help\".\n";
+    }
+}
+
+// Scheduler thread
+void scheduler_thread() {
+    while (is_running) {
+        if (is_initialized) {
+            g_cpu_cycles++; // system clock tick
+
+            std::vector<int> pids_to_ready;
+
+            // check sleeping processes
+            {
+                std::lock_guard<std::mutex> lk(g_processes_mtx);
+                for (auto& p : g_processes) {
+                    // if sleeping (running and sleep_left > 0)
+                    if (p.running && p.sleep_left > 0) {
+                        p.sleep_left--;
+                        if (p.sleep_left == 0) {
+                            // process is done sleeping, mark it as ready
+                            p.running = false; 
+                            pids_to_ready.push_back(p.pid);
+                        }
+                    }
+                }
+            } 
+
+            // add new process to ready queue
+            if (!pids_to_ready.empty()) {
+                std::lock_guard<std::mutex> lk(g_ready_queue_mtx);
+                for (int pid : pids_to_ready) {
+                    g_ready_queue.push(pid);
+                }
+            }
+
+            // TODO: Step 4 logic for 'scheduler-start' will go here
+            // (checking g_cpu_cycles % g_config.batch_process_freq)
+
+        } // end if(is_initialized)
+
+        // sleep
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 }
 
@@ -271,10 +582,11 @@ void keyboard_handler_thread() {
 int main() {
     int cpuCycles = 0;
     string input;
-    bool is_running = true;
+    //bool is_running = true;
 
     thread displayThread(display_handler_thread);
     thread keyboardThread(keyboard_handler_thread);
+    thread schedulerThread(scheduler_thread);
 	
 	cout << "Command> ";
     while(is_running){
@@ -307,5 +619,6 @@ int main() {
 
     displayThread.join();
     keyboardThread.join();
+    schedulerThread.join();
     return 0;
 }
