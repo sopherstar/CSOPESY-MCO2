@@ -102,7 +102,8 @@ struct PseudoProcess {
 std::vector<PseudoProcess> g_processes;
 std::mutex g_processes_mtx;
 int g_next_pid = 1;
-
+std::atomic<bool> scheduler_generating{false};
+std::thread scheduler;
 
 static inline uint16_t clamp_u16(int32_t x) {
     if (x < 0) return 0;
@@ -154,11 +155,65 @@ static std::vector<Instruction> make_default_program(const std::string& pname) {
 
 //screen marquee logic TO-DO: create this
 
-//scheduler start TO-DO: create this
+// Scheduler Start
+void scheduler_start() {
+    // Start generating dummy processes periodically until stopped
+    scheduler_generating = true;
+    while (scheduler_generating && is_running) {
+        PseudoProcess proc;
+        // Reserve a pid under lock
+        {
+            std::lock_guard<std::mutex> lk(g_processes_mtx);
+            proc.pid = g_next_pid++;
+        }
 
-//scheduler stop TO-DO: create this
+        std::ostringstream pname_ss;
+        pname_ss << "auto-" << proc.pid;
+        proc.name = pname_ss.str();
+        proc.start_time = std::chrono::steady_clock::now();
+        proc.running = false;
+        proc.program = make_default_program(proc.name);
 
-//report utilization TO-DO: create this
+        {
+            std::lock_guard<std::mutex> lk(g_processes_mtx);
+            g_processes.push_back(std::move(proc));
+        }
+
+        // Wait before creating next auto-process
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    }
+    scheduler_generating = false;
+}
+
+// Scheduler Stop
+void scheduler_stop() {
+    // Signal the generator to stop
+    scheduler_generating = false;
+
+    // If thread is joinable (we created a non-detached thread), join it to clean up
+    if (scheduler.joinable()) {
+        try {
+            scheduler.join();
+        } catch (...) {
+            // swallow exceptions to avoid termination; nothing much to do here
+        }
+    }
+}
+
+// Report Utilization
+void report_utilization() {
+    std::lock_guard<std::mutex> lk(g_processes_mtx);
+    if (g_processes.empty()) {
+        std::cout << "No processes found.\n";
+        return;
+    }
+
+    std::cout << "PID\tSTATE\tUPTIME(ms)\tNAME\n";
+    for (const auto& p : g_processes) {
+        const char* st = p.finished ? "FINISHED" : (p.running ? "RUNNING" : "READY");
+        std::cout << p.pid << '\t' << st << '\t' << uptime_ms(p) << '\t' << p.name << '\n';
+    }
+}
 
 // Enum to signal the result of an instruction
 enum class ExecStatus { OK, SLEEP, FINISHED };
@@ -497,10 +552,23 @@ void command_interpreter_thread(string input) {
     	cout << "Unknown 'screen' option. Try: screen -s <name>  or  screen -ls\n";
     }
     else if (cmd == "scheduler-start") {
-        // TODO
+        if (scheduler_generating) {
+            cout << "Scheduler already running.\n";
+        } else {
+            if (scheduler.joinable()) {
+                scheduler.join();
+            }
+            scheduler = std::thread(scheduler_start);
+            cout << "Scheduler started.\n";
+        }
     }
     else if (cmd == "scheduler-stop") {
-        // TODO
+        if (!scheduler_generating) {
+            cout << "Scheduler is not running.\n";
+        } else {
+            scheduler_stop();
+            cout << "Scheduler stopped.\n";
+        }
     }
     else if (cmd == "report-util") {
         // TODO
@@ -560,8 +628,9 @@ void display_handler_thread() {
     cout << "\nGroup developer:" <<endl;
     cout << "CISNEROS, JOHN MAVERICK ZARAGOSA\nILUSTRE, SOPHIA MACAPINLAC\nJOCSON, VINCE MIGUEL\nVERGARA, ROYCE AARON ADAM\n" <<endl;
 
-    cout << "Version date:\n" <<endl;
+    cout << "Version date: 05/11/2025 1:03pm\n" <<endl;
 
+    cout << "Type 'initialize' to initialize the system.\n\n";
     cout << "Type 'help' to see the list of commands.\n\n";
     //layout and design of the console
 }
