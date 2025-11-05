@@ -166,54 +166,57 @@ static std::vector<Instruction> make_default_program(const std::string& pname) {
 
 // Scheduler Start
 void scheduler_start() {
-    // Start generating dummy processes based on CPU ticks (g_cpu_cycles)
     scheduler_generating = true;
-
-    // Ensure batch frequency sensible
     long freq = g_config.batch_process_freq;
     if (freq <= 0) freq = 1;
 
-    // Track last tick used to avoid creating multiple processes for same tick
     long long last_tick = g_cpu_cycles.load();
 
     while (scheduler_generating && is_running) {
         long long cur = g_cpu_cycles.load();
         if (cur - last_tick >= freq) {
-            // time to create a new process
-            PseudoProcess proc;
-            // Reserve a pid under lock
-            {
-                std::lock_guard<std::mutex> lk(g_processes_mtx);
-                proc.pid = g_next_pid++;
-            }
-
-            std::ostringstream pname_ss;
-            pname_ss << "p";
-            if (proc.pid < 10) pname_ss << "0";
-            pname_ss << proc.pid;
-            proc.name = pname_ss.str();;
-            proc.start_time = std::chrono::steady_clock::now();
-            proc.running = false;
-            proc.program = make_default_program(proc.name);
-
-            {
-                std::lock_guard<std::mutex> lk(g_processes_mtx);
-                g_processes.push_back(std::move(proc));
-            }
-
-            // push into ready queue so CPU cores can pick it up
+            
+            bool should_generate = false;
             {
                 std::lock_guard<std::mutex> lk(g_ready_queue_mtx);
-                g_ready_queue.push(g_next_pid - 1);
+                if (g_ready_queue.size() < g_config.num_cpu * 2) {  
+                    should_generate = true;
+                }
             }
 
-            std::cout << "[scheduler] generated process " << proc.name << "\n";
+            if (should_generate) {
+                for (int i = 0; i < g_config.num_cpu; ++i) {
+                    PseudoProcess proc;
+                    {
+                        std::lock_guard<std::mutex> lk(g_processes_mtx);
+                        proc.pid = g_next_pid++;
+                    }
 
-            // advance last_tick
+                    std::ostringstream pname_ss;
+                    pname_ss << "p";
+                    if (proc.pid < 10) pname_ss << "0";
+                    pname_ss << proc.pid;
+                    proc.name = pname_ss.str();
+                    proc.start_time = std::chrono::steady_clock::now();
+                    proc.running = false;
+                    proc.program = make_default_program(proc.name);
+
+                    {
+                        std::lock_guard<std::mutex> lk(g_processes_mtx);
+                        g_processes.push_back(std::move(proc));
+                    }
+
+                    {
+                        std::lock_guard<std::mutex> lk(g_ready_queue_mtx);
+                        g_ready_queue.push(g_next_pid - 1);
+                    }
+                    // std::cout << "[scheduler] generated " << proc.name << "\n";
+                }
+            }
+
             last_tick = cur;
         }
 
-        // Sleep short while to avoid busy loop
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
 
@@ -631,7 +634,7 @@ void command_interpreter_thread(string input) {
     	}
 
     	if (tokens[1] == "-ls") {
-        	report_utilization(); // This now prints the full report
+        	report_utilization();
         	return;
     	}
 
