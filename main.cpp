@@ -33,6 +33,8 @@ Config g_config;
 std::atomic<int> g_cpu_cycles{0};
 std::queue<int> g_ready_queue;
 std::mutex g_ready_queue_mtx;
+std::mutex g_rng_mtx;
+std::atomic<int> g_attached_pid{-1};
 
 // shared state
 bool is_initialized = false;
@@ -50,6 +52,13 @@ vector<string> tokenize_input(const string& input) {
         tokens.push_back(token);
     }
     return tokens;
+}
+
+//HELPER FUNCTION
+void clear_screen() {
+    // This is a common cross-platform way.
+    // \033[2J clears the screen, \033[H moves cursor to top-left.
+    cout << "\033[2J\033[H";
 }
 
 enum class InstrType { PRINT, DECLARE, ADD, SUBTRACT, SLEEP, FOR_ };
@@ -179,8 +188,10 @@ void scheduler_start() {
             }
 
             std::ostringstream pname_ss;
-            pname_ss << "auto-" << proc.pid;
-            proc.name = pname_ss.str();
+            pname_ss << "p";
+            if (proc.pid < 10) pname_ss << "0";
+            pname_ss << proc.pid;
+            proc.name = pname_ss.str();;
             proc.start_time = std::chrono::steady_clock::now();
             proc.running = false;
             proc.program = make_default_program(proc.name);
@@ -196,7 +207,7 @@ void scheduler_start() {
                 g_ready_queue.push(g_next_pid - 1);
             }
 
-            std::cout << "[scheduler] generated process auto-" << (g_next_pid - 1) << "\n";
+            std::cout << "[scheduler] generated process " << proc.name << "\n";
 
             // advance last_tick
             last_tick = cur;
@@ -229,6 +240,26 @@ void scheduler_stop() {
 void report_utilization(const std::string& out_file = "") {
     std::lock_guard<std::mutex> lk(g_processes_mtx);
     std::ostringstream oss;
+
+    int cores_used = 0;
+    for (const auto& p : g_processes) {
+        // 'running' == true means it's on a core OR sleeping
+        if (p.running) { 
+            cores_used++;
+        }
+    }
+    int cores_available = g_config.num_cpu - cores_used;
+    if (cores_available < 0) cores_available = 0; // Safety check
+    
+    double cpu_utilization = 0.0;
+    if (g_config.num_cpu > 0) {
+        cpu_utilization = (static_cast<double>(cores_used) / g_config.num_cpu) * 100.0;
+    }
+
+    oss << "CPU utilization: " << (int)cpu_utilization << "%\n";
+    oss << "Cores used: " << cores_used << "\n";
+    oss << "Cores available: " << cores_available << "\n\n";
+    
     if (g_processes.empty()) {
         oss << "No processes found.\n";
     } else {
@@ -437,7 +468,62 @@ void command_interpreter_thread(string input) {
 
     const string& cmd = tokens[0];
 
-	// exit works anytime
+    // check if in attached mode
+    int attached_pid = g_attached_pid.load();
+
+    // attached mode
+    if (attached_pid != -1) {
+        if (cmd == "exit") {
+            g_attached_pid = -1; 
+            clear_screen();
+            cout << "Returned to main console.\n";
+        } 
+        else if (cmd == "process-smi") {
+            std::lock_guard<std::mutex> lk(g_processes_mtx);
+            PseudoProcess* p_ptr = nullptr;
+            for(auto& p : g_processes) {
+                if(p.pid == attached_pid) {
+                    p_ptr = &p;
+                    break;
+                }
+            }
+
+            if (p_ptr == nullptr) {
+                cout << "Error: Process " << attached_pid << " not found.\n";
+                g_attached_pid = -1; 
+                return;
+            }
+
+            cout << "Process name: " << p_ptr->name << "\n";
+            cout << "ID: " << p_ptr->pid << "\n";
+            
+            cout << "Logs:\n";
+            if (p_ptr->log.empty()) {
+                cout << "  (No log output)\n";
+            } else {
+                for(const auto& log_msg : p_ptr->log) {
+                    cout << "  " << log_msg << "\n";
+                }
+            }
+            
+            cout << "Current instruction line: " << p_ptr->pc << "\n";
+            cout << "Total lines of code: " << p_ptr->program.size() << "\n";
+
+            if (p_ptr->finished) {
+                cout << "Finished!\n";
+            }
+        }
+        else {
+            cout << "Unknown command. Valid commands in process screen are:\n"
+                 << "  'process-smi' - print process status\n"
+                 << "  'exit'          - return to main console\n";
+        }
+        return;
+    }
+
+    // main console mode
+    
+    // exit works anytime
     if (cmd == "exit") {
         cout << "\nExiting...\n";
         cout << "\nProgram Exited.\n";
@@ -445,7 +531,7 @@ void command_interpreter_thread(string input) {
         return;
     }
 
-// initialize before anything else
+    // initialize before anything else
     if (cmd == "initialize") {
         if (is_initialized) {
             cout << "Already initialized.\n";
@@ -528,7 +614,8 @@ void command_interpreter_thread(string input) {
         cout << "\"help\" - displays the commands and their descriptions\n";
         cout << "\"initialize\" - initialize the processor configuration (must be run first)\n";
         cout << "\"exit\" - terminates the console\n";
-        cout << "\"screen -s <program name>\" - creates a new process\n";
+        cout << "\"screen -s <program name>\" - creates a new process and attaches to it\n";
+        cout << "\"screen -r <program name>\" - re-attaches to a running process\n";
         cout << "\"screen -ls\" - lists all running processes\n";
         cout << "\"scheduler-start\" - start the scheduler which continuously generates a batch of dummy processes for the CPU scheduler\n";
         cout << "\"scheduler-stop\" - stop the scheduler/generating dummy processes \n";
@@ -537,22 +624,14 @@ void command_interpreter_thread(string input) {
     else if (cmd == "screen") {
         if (tokens.size() == 1) {
         cout << "Usage:\n"
-             << "  screen -s <process name>   Create a new process\n"
+             << "  screen -s <process name>   Create a new process and attach\n"
+             << "  screen -r <process name>   Re-attach to a process\n"
              << "  screen -ls                 List running processes\n";
         return;
     	}
 
     	if (tokens[1] == "-ls") {
-        	std::lock_guard<std::mutex> lk(g_processes_mtx);
-        	if (g_processes.empty()) {
-            	cout << "No processes found.\n";
-            	return;
-        	}
-        	cout << "PID\tSTATE\tUPTIME(ms)\tNAME\n";
-        	for (const auto& p : g_processes) {
-            	const char* st = p.finished ? "FINISHED" : (p.running ? "RUNNING" : "READY");
-            	cout << p.pid << '\t' << st << '\t' << uptime_ms(p) << '\t' << p.name << '\n';
-        	}
+        	report_utilization(); // This now prints the full report
         	return;
     	}
 
@@ -575,6 +654,7 @@ void command_interpreter_thread(string input) {
         	proc.start_time = std::chrono::steady_clock::now();
         	proc.running = false;
         	proc.program = make_default_program(pname);
+            int new_pid = proc.pid; // Store PID
 
         	{
             	std::lock_guard<std::mutex> lk(g_processes_mtx);
@@ -583,13 +663,52 @@ void command_interpreter_thread(string input) {
 
             {
                 std::lock_guard<std::mutex> lk(g_ready_queue_mtx);
-                g_ready_queue.push(g_next_pid - 1);
+                g_ready_queue.push(new_pid);
             }
-        	cout << "Started process \"" << pname << "\" with PID " << (g_next_pid - 1) << ".\n";
+        	
+
+            cout << "Started process \"" << pname << "\" with PID " << new_pid << ".\n";
+            cout << "Attaching to process...\n";
+            g_attached_pid = new_pid; 
+            clear_screen();
         	return;
     	}
 
-    	cout << "Unknown 'screen' option. Try: screen -s <name>  or  screen -ls\n";
+        if (tokens[1] == "-r") {
+            if (tokens.size() < 3) {
+                cout << "Error: missing <process name>.\n";
+                return;
+            }
+
+            std::ostringstream oss;
+        	for (size_t i = 2; i < tokens.size(); ++i) {
+            	if (i > 2) oss << ' ';
+            	oss << tokens[i];
+        	}
+        	std::string pname = oss.str();
+
+            int pid_to_attach = -1;
+            {
+                std::lock_guard<std::mutex> lk(g_processes_mtx);
+                for (auto& p : g_processes) {
+                    if (p.name == pname && !p.finished) {
+                        pid_to_attach = p.pid;
+                        break;
+                    }
+                }
+            }
+
+            if (pid_to_attach != -1) {
+                g_attached_pid = pid_to_attach;
+                clear_screen();
+                cout << "Re-attached to process " << pname << ".\n";
+            } else {
+                cout << "Error: Process <" << pname << "> not found or has finished.\n";
+            }
+            return;
+        }
+
+    	cout << "Unknown 'screen' option. Try: 'help'\n";
     }
     else if (cmd == "scheduler-start") {
         if (scheduler_generating) {
@@ -651,9 +770,6 @@ void scheduler_thread() {
                 }
             }
 
-            // TODO: Step 4 logic for 'scheduler-start' will go here
-            // (checking g_cpu_cycles % g_config.batch_process_freq)
-
         } // end if(is_initialized)
 
         // sleep
@@ -690,28 +806,48 @@ void keyboard_handler_thread() {
 
 
 int main() {
-    int cpuCycles = 0;
     string input;
-    //bool is_running = true;
 
     thread displayThread(display_handler_thread);
     thread keyboardThread(keyboard_handler_thread);
     thread schedulerThread(scheduler_thread);
 	
-	cout << "Command> ";
+    std::string current_prompt = "Command> ";
+    cout << current_prompt;
+
     while(is_running){
         {
             std::lock_guard<std::mutex> lock(key_buffer_mutex);
             while (!key_buffer.empty()) {
                 char ch = key_buffer.front();
                 key_buffer.pop();
-                //std::cout << "\nKey pressed: " << ch << std::endl;
+                
                 if (ch == '\r') { // enter
                     cout << endl;
                     thread commandThread(command_interpreter_thread, input);
                     commandThread.join();
                     input.clear();
-                    cout << "Command> ";
+                    
+                    // prompt
+                    int attached_pid = g_attached_pid.load();
+                    if (attached_pid != -1) {
+                        // process screen
+                        std::lock_guard<std::mutex> lk(g_processes_mtx);
+                        std::string pname = "process";
+                        for(auto& p : g_processes) {
+                            if (p.pid == attached_pid) {
+                                pname = p.name;
+                                break;
+                            }
+                        }
+                        current_prompt = pname + ":\\>";
+
+                    } else {
+                        // main menu
+                        current_prompt = "Command> ";
+                    }
+                    cout << current_prompt;
+
                 } else if (ch == '\b') { // backspace
                     if (!input.empty()) {
                         input.pop_back();
@@ -730,5 +866,6 @@ int main() {
     displayThread.join();
     keyboardThread.join();
     schedulerThread.join();
+    scheduler_stop(); // Clean up scheduler thread
     return 0;
 }
