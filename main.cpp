@@ -157,31 +157,55 @@ static std::vector<Instruction> make_default_program(const std::string& pname) {
 
 // Scheduler Start
 void scheduler_start() {
-    // Start generating dummy processes periodically until stopped
+    // Start generating dummy processes based on CPU ticks (g_cpu_cycles)
     scheduler_generating = true;
+
+    // Ensure batch frequency sensible
+    long freq = g_config.batch_process_freq;
+    if (freq <= 0) freq = 1;
+
+    // Track last tick used to avoid creating multiple processes for same tick
+    long long last_tick = g_cpu_cycles.load();
+
     while (scheduler_generating && is_running) {
-        PseudoProcess proc;
-        // Reserve a pid under lock
-        {
-            std::lock_guard<std::mutex> lk(g_processes_mtx);
-            proc.pid = g_next_pid++;
+        long long cur = g_cpu_cycles.load();
+        if (cur - last_tick >= freq) {
+            // time to create a new process
+            PseudoProcess proc;
+            // Reserve a pid under lock
+            {
+                std::lock_guard<std::mutex> lk(g_processes_mtx);
+                proc.pid = g_next_pid++;
+            }
+
+            std::ostringstream pname_ss;
+            pname_ss << "auto-" << proc.pid;
+            proc.name = pname_ss.str();
+            proc.start_time = std::chrono::steady_clock::now();
+            proc.running = false;
+            proc.program = make_default_program(proc.name);
+
+            {
+                std::lock_guard<std::mutex> lk(g_processes_mtx);
+                g_processes.push_back(std::move(proc));
+            }
+
+            // push into ready queue so CPU cores can pick it up
+            {
+                std::lock_guard<std::mutex> lk(g_ready_queue_mtx);
+                g_ready_queue.push(g_next_pid - 1);
+            }
+
+            std::cout << "[scheduler] generated process auto-" << (g_next_pid - 1) << "\n";
+
+            // advance last_tick
+            last_tick = cur;
         }
 
-        std::ostringstream pname_ss;
-        pname_ss << "auto-" << proc.pid;
-        proc.name = pname_ss.str();
-        proc.start_time = std::chrono::steady_clock::now();
-        proc.running = false;
-        proc.program = make_default_program(proc.name);
-
-        {
-            std::lock_guard<std::mutex> lk(g_processes_mtx);
-            g_processes.push_back(std::move(proc));
-        }
-
-        // Wait before creating next auto-process
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        // Sleep short while to avoid busy loop
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
+
     scheduler_generating = false;
 }
 
@@ -201,17 +225,33 @@ void scheduler_stop() {
 }
 
 // Report Utilization
-void report_utilization() {
+// If out_file is non-empty, the same report is also saved to that file (overwrites existing file).
+void report_utilization(const std::string& out_file = "") {
     std::lock_guard<std::mutex> lk(g_processes_mtx);
+    std::ostringstream oss;
     if (g_processes.empty()) {
-        std::cout << "No processes found.\n";
-        return;
+        oss << "No processes found.\n";
+    } else {
+        oss << "PID\tSTATE\tUPTIME(ms)\tNAME\n";
+        for (const auto& p : g_processes) {
+            const char* st = p.finished ? "FINISHED" : (p.running ? "RUNNING" : "READY");
+            oss << p.pid << '\t' << st << '\t' << uptime_ms(p) << '\t' << p.name << '\n';
+        }
     }
 
-    std::cout << "PID\tSTATE\tUPTIME(ms)\tNAME\n";
-    for (const auto& p : g_processes) {
-        const char* st = p.finished ? "FINISHED" : (p.running ? "RUNNING" : "READY");
-        std::cout << p.pid << '\t' << st << '\t' << uptime_ms(p) << '\t' << p.name << '\n';
+    // Print to console
+    std::cout << oss.str();
+
+    // Optionally save to file (overwrite)
+    if (!out_file.empty()) {
+        std::ofstream ofs(out_file, std::ios::out | std::ios::trunc);
+        if (ofs.is_open()) {
+            ofs << oss.str();
+            ofs.close();
+            std::cout << "Saved report to '" << out_file << "'.\n";
+        } else {
+            std::cout << "Error: could not open file '" << out_file << "' for writing.\n";
+        }
     }
 }
 
@@ -571,7 +611,8 @@ void command_interpreter_thread(string input) {
         }
     }
     else if (cmd == "report-util") {
-        // TODO
+        // Print report and save to csopesy-log.txt
+        report_utilization("csopesy-log.txt");
     }
     else {
         cout << "Unknown command. Type \"help\".\n";
