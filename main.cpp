@@ -175,17 +175,28 @@ void scheduler_start() {
     while (scheduler_generating && is_running) {
         long long cur = g_cpu_cycles.load();
         if (cur - last_tick >= freq) {
-            
-            bool should_generate = false;
+
+            int running_count = 0;
+            int ready_count = 0;
+
+            // count running and ready processes
             {
-                std::lock_guard<std::mutex> lk(g_ready_queue_mtx);
-                if (g_ready_queue.size() < g_config.num_cpu * 2) {  
-                    should_generate = true;
+                std::lock_guard<std::mutex> lk1(g_processes_mtx);
+                for (auto& p : g_processes) {
+                    if (p.running && !p.finished) running_count++;
                 }
             }
+            {
+                std::lock_guard<std::mutex> lk2(g_ready_queue_mtx);
+                ready_count = (int)g_ready_queue.size();
+            }
 
-            if (should_generate) {
-                for (int i = 0; i < g_config.num_cpu; ++i) {
+            int active_total = running_count + ready_count;
+
+            // Only generate if fewer than num_cpu active processes
+            if (active_total < g_config.num_cpu) {
+                int to_generate = g_config.num_cpu - active_total;
+                for (int i = 0; i < to_generate; ++i) {
                     PseudoProcess proc;
                     {
                         std::lock_guard<std::mutex> lk(g_processes_mtx);
@@ -210,6 +221,7 @@ void scheduler_start() {
                         std::lock_guard<std::mutex> lk(g_ready_queue_mtx);
                         g_ready_queue.push(g_next_pid - 1);
                     }
+
                     // std::cout << "[scheduler] generated " << proc.name << "\n";
                 }
             }
@@ -217,7 +229,8 @@ void scheduler_start() {
             last_tick = cur;
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        // give CPU threads time to pick up work
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
     }
 
     scheduler_generating = false;
