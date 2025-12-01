@@ -14,6 +14,7 @@ using namespace std;
 #include <mutex>
 #include <unordered_map>
 #include <fstream>
+#include <iomanip>
 #include <algorithm>
 
 // default configuration settings, loaded from config.txt
@@ -25,41 +26,26 @@ struct Config {
     long min_ins = 1000;
     long max_ins = 2000;
     long delay_per_exec = 0;
+    
+    // MCO2 memory-related config
+    long max_overall_mem   = 65536; // bytes, will be overridden by config.txt
+    long mem_per_frame     = 64;    // bytes per frame
+    long min_mem_per_proc  = 64;    // bytes
+    long max_mem_per_proc  = 65536; // bytes
 };
 
 // global configuration
 Config g_config;
 
-std::atomic<int> g_cpu_cycles{0};
-std::queue<int> g_ready_queue;
-std::mutex g_ready_queue_mtx;
-std::mutex g_rng_mtx;
-std::atomic<int> g_attached_pid{-1};
-
-// shared state
-bool is_initialized = false;
-size_t display_width = 100;         //TO-DO : do we need this
-std::queue<char> key_buffer;    //TO-DO : do we need this
-std::mutex key_buffer_mutex;    //TO-DO : do we need this
-std::atomic<bool> is_running{true};
-
-//HELPER FUNCTION
-vector<string> tokenize_input(const string& input) {
-    vector<string> tokens;
-    istringstream iss(input);
-    string token;
-    while (iss >> token) {
-        tokens.push_back(token);
-    }
-    return tokens;
-}
-
-//HELPER FUNCTION
-void clear_screen() {
-    // This is a common cross-platform way.
-    // \033[2J clears the screen, \033[H moves cursor to top-left.
-    cout << "\033[2J\033[H";
-}
+// =======================
+// MCO2: Memory structures
+// =======================
+struct Frame {
+    int frame_id{-1};     // index of this frame
+    bool used{false};     // is this frame currently allocated?
+    int owner_pid{-1};    // which process owns this frame (-1 = none)
+    int page_index{-1};   // which virtual page of that process (-1 = none)
+};
 
 enum class InstrType { PRINT, DECLARE, ADD, SUBTRACT, SLEEP, FOR_ };
 
@@ -86,6 +72,16 @@ struct Instruction {
     uint32_t repeats{0};
 };
 
+// =======================
+// MCO2: Per-process memory
+// =======================
+struct PageEntry {
+    int frame_id{-1};               // which physical frame holds this page (-1 = not in RAM)
+    bool present{false};            // true if page currently in RAM
+    bool in_backing_store{false};   // true if page data exists in backing store
+    long backing_store_pos{-1};     // optional: byte/line offset in backing store file
+};
+
 struct PseudoProcess {
     int pid{0};
     std::string name;
@@ -95,9 +91,16 @@ struct PseudoProcess {
     size_t pc{0};
     uint8_t sleep_left{0};
     std::vector<Instruction> program;
-    std::unordered_map<std::string, uint16_t> mem;
+    std::unordered_map<std::string, uint16_t> mem; // logical variables
 
     std::vector<std::string> log; // For PRINT instruction
+
+    // ============================
+    // MCO2: per-process memory info
+    // ============================
+    long mem_bytes{0};                 // total virtual memory size for this process (bytes)
+    int num_pages{0};                  // number of pages = ceil(mem_bytes / mem_per_frame)
+    std::vector<PageEntry> page_table; // one entry per virtual page
 
     // Stack for FOR loops
     struct LoopFrame {
@@ -108,11 +111,288 @@ struct PseudoProcess {
     std::vector<LoopFrame> loop_stack;
 };
 
+// All physical frames
+std::vector<Frame> g_frames;
+std::mutex g_frames_mtx;
+
+std::queue<int> g_frame_fifo;   // frame ids used in allocation order (for FIFO replacement)
+
+// Paging & CPU statistics (for vmstat / process-smi)
+std::atomic<long> g_pages_paged_in{0};
+std::atomic<long> g_pages_paged_out{0};
+std::atomic<long> g_idle_cpu_ticks{0};
+std::atomic<long> g_active_cpu_ticks{0};
+
+std::atomic<int> g_cpu_cycles{0};
+std::queue<int> g_ready_queue;
+std::mutex g_ready_queue_mtx;
+std::mutex g_rng_mtx;
+std::atomic<int> g_attached_pid{-1};
+
 std::vector<PseudoProcess> g_processes;
 std::mutex g_processes_mtx;
 int g_next_pid = 1;
 std::atomic<bool> scheduler_generating{false};
 std::thread scheduler;
+
+// =======================
+// MCO2: Backing store
+// =======================
+const std::string BACKING_STORE_FILE = "csopesy-backing-store.txt";
+std::mutex g_backing_store_mtx;
+
+// Reset / initialize backing store file (truncate + header)
+void backing_store_reset() {
+    std::lock_guard<std::mutex> lk(g_backing_store_mtx);
+    std::ofstream ofs(BACKING_STORE_FILE, std::ios::trunc);
+    if (ofs) {
+        ofs << "# CSOPESY backing store\n";
+        ofs << "# Each page entry will be written by the paging system.\n";
+    }
+}
+
+// Append a log entry whenever a page is evicted to backing store.
+void backing_store_write_page_entry(int pid, int page_index) {
+    std::lock_guard<std::mutex> lk(g_backing_store_mtx);
+    std::ofstream ofs(BACKING_STORE_FILE, std::ios::app);
+    if (ofs) {
+        ofs << "EVICT pid=" << pid << " page=" << page_index << "\n";
+    }
+}
+
+// =======================
+// MCO2: Demand paging core
+// =======================
+
+// Convert a byte address (within a process) to a virtual page index.
+int address_to_page_index(long addr) {
+    long page_size = g_config.mem_per_frame;
+    if (page_size <= 0) page_size = 1;
+    if (addr < 0) return -1;
+    return static_cast<int>(addr / page_size);
+}
+
+// Offset within the page (0 .. page_size-1)
+long page_offset_within_page(long addr) {
+    long page_size = g_config.mem_per_frame;
+    if (page_size <= 0) page_size = 1;
+    if (addr < 0) return -1;
+    return addr % page_size;
+}
+
+// Helper: must be called with g_frames_mtx already locked.
+static int find_free_frame_locked() {
+    for (size_t i = 0; i < g_frames.size(); ++i) {
+        if (!g_frames[i].used) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+// Helper: must be called with g_frames_mtx already locked.
+static int select_victim_frame_fifo_locked() {
+    while (!g_frame_fifo.empty()) {
+        int fid = g_frame_fifo.front();
+        g_frame_fifo.pop();
+        if (fid >= 0 && fid < static_cast<int>(g_frames.size())) {
+            if (g_frames[fid].used) {
+                // Oldest still-in-use frame; choose it as victim.
+                return fid;
+            }
+        }
+    }
+    // Fallback: scan for any used frame if queue is empty or stale.
+    for (size_t i = 0; i < g_frames.size(); ++i) {
+        if (g_frames[i].used) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+// Basic page-fault handler: load page into a free frame.
+// NOTE: For now, this does NOT do replacement; if no frame is free, it fails.
+bool handle_page_fault(PseudoProcess& proc, int page_index) {
+    if (page_index < 0 || page_index >= proc.num_pages) {
+        return false;
+    }
+
+    int frame_id = -1;
+    int victim_pid = -1;
+    int victim_page_index = -1;
+
+    {
+        std::lock_guard<std::mutex> lk(g_frames_mtx);
+
+        // 1) Try to find a free frame first.
+        frame_id = find_free_frame_locked();
+
+        // 2) If none, select a victim frame via FIFO and evict.
+        if (frame_id == -1) {
+            int victim_frame = select_victim_frame_fifo_locked();
+            if (victim_frame == -1) {
+                // No frames at all (should not happen if memory is configured correctly).
+                return false;
+            }
+
+            Frame& vf = g_frames[victim_frame];
+            victim_pid = vf.owner_pid;
+            victim_page_index = vf.page_index;
+
+            // Log eviction to backing store (logical only, not real bytes yet)
+            backing_store_write_page_entry(victim_pid, victim_page_index);
+            g_pages_paged_out.fetch_add(1);
+
+            // Mark the victim frame as available for new page
+            frame_id = victim_frame;
+            // The PageEntry of the victim process will be updated after we leave this mutex.
+
+            // Note: we keep vf.used = true (frame stays allocated) and just overwrite
+            //       owner_pid/page_index below when assigning to the new process.
+        }
+
+        // Assign this frame to the faulting process + page
+        Frame& fr = g_frames[frame_id];
+        fr.used = true;
+        fr.owner_pid = proc.pid;
+        fr.page_index = page_index;
+
+        // For FIFO: every time a frame is used for a page, enqueue it.
+        g_frame_fifo.push(frame_id);
+    }
+
+    // 3) If we evicted someone, update their page_table (no extra locks – caller
+    //    already holds g_processes_mtx in cpu_core_function).
+    if (victim_pid != -1) {
+        for (auto& other : g_processes) {
+            if (other.pid == victim_pid) {
+                if (victim_page_index >= 0 &&
+                    victim_page_index < static_cast<int>(other.page_table.size())) {
+
+                    PageEntry& vpe = other.page_table[victim_page_index];
+                    vpe.present = false;
+                    vpe.frame_id = -1;
+                    vpe.in_backing_store = true;
+                    // backing_store_pos can remain -1 since we don't store real bytes.
+                }
+                break;
+            }
+        }
+    }
+
+    // 4) Finally, update the faulting process's page table.
+    PageEntry& pe = proc.page_table[page_index];
+    pe.frame_id = frame_id;
+    pe.present = true;
+    // This page is now in RAM. You can choose to keep in_backing_store as false or true
+    // depending on whether you want write-back or write-through behavior; for now:
+    pe.in_backing_store = false;
+
+    g_pages_paged_in.fetch_add(1);
+    return true;
+}
+
+// Ensure a page is resident; used later by READ/WRITE.
+bool ensure_page_loaded(PseudoProcess& proc, int page_index) {
+    if (page_index < 0 || page_index >= proc.num_pages) {
+        return false;
+    }
+    PageEntry& pe = proc.page_table[page_index];
+    if (pe.present) return true;
+    return handle_page_fault(proc, page_index);
+}
+
+// Result of translating and validating a virtual memory address.
+struct AddressResult {
+    bool ok{false};          // true if address is valid and page loaded
+    int page_index{-1};      // virtual page index
+    long offset{-1};         // offset within page (0 .. page_size-1)
+    std::string error_msg;   // reason for failure
+};
+
+// Validate virtual address and ensure the page is loaded.
+// This is the main helper your READ/WRITE instructions will use.
+AddressResult check_address_and_load(PseudoProcess& proc, long addr) {
+    AddressResult res;
+
+    // 1) Validate address range
+    if (addr < 0 || addr >= proc.mem_bytes) {
+        res.ok = false;
+        res.error_msg = "Invalid memory address: out of process memory range.";
+        return res;
+    }
+
+    // 2) Compute virtual page index & offset
+    long page_size = g_config.mem_per_frame;
+    if (page_size <= 0) page_size = 1;
+
+    int page_index = static_cast<int>(addr / page_size);
+    long offset    = addr % page_size;
+
+    // 3) Ensure the page is loaded (may cause page fault + replacement)
+    if (!ensure_page_loaded(proc, page_index)) {
+        res.ok = false;
+        res.error_msg = "Page fault could not be resolved (no free frames or replacement failed).";
+        return res;
+    }
+
+    // 4) Success
+    res.ok = true;
+    res.page_index = page_index;
+    res.offset = offset;
+    return res;
+}
+
+// For instructions that require checking address only
+bool validate_address_only(PseudoProcess& proc, long addr, std::string& err) {
+    auto res = check_address_and_load(proc, addr);
+    if (!res.ok) {
+        err = res.error_msg;
+        return false;
+    }
+    return true;
+}
+
+// For retrieving frame ID + final physical location
+bool translate_address(PseudoProcess& proc, long addr, int& frame_id, long& offset, std::string& err) {
+    auto res = check_address_and_load(proc, addr);
+    if (!res.ok) {
+        err = res.error_msg;
+        return false;
+    }
+
+    // Extracting the frame from the page table
+    PageEntry& pe = proc.page_table[res.page_index];
+    frame_id = pe.frame_id;
+    offset = res.offset;
+    return true;
+}
+
+// shared state
+bool is_initialized = false;
+size_t display_width = 100;         //TO-DO : do we need this
+std::queue<char> key_buffer;    //TO-DO : do we need this
+std::mutex key_buffer_mutex;    //TO-DO : do we need this
+std::atomic<bool> is_running{true};
+
+//HELPER FUNCTION
+vector<string> tokenize_input(const string& input) {
+    vector<string> tokens;
+    istringstream iss(input);
+    string token;
+    while (iss >> token) {
+        tokens.push_back(token);
+    }
+    return tokens;
+}
+
+//HELPER FUNCTION
+void clear_screen() {
+    // This is a common cross-platform way.
+    // \033[2J clears the screen, \033[H moves cursor to top-left.
+    cout << "\033[2J\033[H";
+}
 
 static inline uint16_t clamp_u16(int32_t x) {
     if (x < 0) return 0;
@@ -211,6 +491,13 @@ void scheduler_start() {
                     proc.start_time = std::chrono::steady_clock::now();
                     proc.running = false;
                     proc.program = make_default_program(proc.name);
+                    
+                    // MCO2: default memory config for auto-generated process
+        			proc.mem_bytes = g_config.min_mem_per_proc;
+        			long page_size = g_config.mem_per_frame;
+        			if (page_size <= 0) page_size = 1;
+        			proc.num_pages = static_cast<int>((proc.mem_bytes + page_size - 1) / page_size);
+        			proc.page_table.assign(proc.num_pages, PageEntry{});
 
                     {
                         std::lock_guard<std::mutex> lk(g_processes_mtx);
@@ -576,8 +863,8 @@ void command_interpreter_thread(string input) {
                     g_config.num_cpu = std::stoi(value_str);
                 } else if (key == "scheduler") {
                     // remove quotes from "rr" or "fcfs"
-                    if (value_str.front() == '"') value_str.erase(0, 1);
-                    if (value_str.back() == '"') value_str.pop_back();
+                    if (!value_str.empty() && value_str.front() == '"') value_str.erase(0, 1);
+                    if (!value_str.empty() && value_str.back() == '"') value_str.pop_back();
                     g_config.scheduler = value_str;
                 } else if (key == "quantum-cycles") {
                     g_config.quantum_cycles = std::stoi(value_str);
@@ -589,6 +876,16 @@ void command_interpreter_thread(string input) {
                     g_config.max_ins = std::stol(value_str);
                 } else if (key == "delay-per-exec") {
                     g_config.delay_per_exec = std::stol(value_str);
+                }
+                // ===== MCO2 memory config keys =====
+                else if (key == "max-overall-mem") {
+                    g_config.max_overall_mem = std::stol(value_str);
+                } else if (key == "mem-per-frame") {
+                    g_config.mem_per_frame = std::stol(value_str);
+                } else if (key == "min-mem-per-proc") {
+                    g_config.min_mem_per_proc = std::stol(value_str);
+                } else if (key == "max-mem-per-proc") {
+                    g_config.max_mem_per_proc = std::stol(value_str);
                 }
             } catch (const std::exception& e) {
                 cout << "Error parsing config line: " << line << "\n";
@@ -607,6 +904,44 @@ void command_interpreter_thread(string input) {
         cout << "  - min-ins: " << g_config.min_ins << "\n";
         cout << "  - max-ins: " << g_config.max_ins << "\n";
         cout << "  - delay-per-exec: " << g_config.delay_per_exec << "\n";
+
+        // MCO2 memory configuration
+        cout << "  - max-overall-mem: " << g_config.max_overall_mem << " bytes\n";
+        cout << "  - mem-per-frame: "   << g_config.mem_per_frame   << " bytes\n";
+        cout << "  - min-mem-per-proc: " << g_config.min_mem_per_proc << " bytes\n";
+        cout << "  - max-mem-per-proc: " << g_config.max_mem_per_proc << " bytes\n";
+        
+        // ==========================
+        // MCO2: initialize frames
+        // ==========================
+        {
+            long num_frames = 0;
+            if (g_config.mem_per_frame > 0 && g_config.max_overall_mem > 0) {
+                num_frames = g_config.max_overall_mem / g_config.mem_per_frame;
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(g_frames_mtx);
+                g_frames.clear();
+                if (num_frames > 0) {
+                    g_frames.reserve(num_frames);
+                    for (long i = 0; i < num_frames; ++i) {
+                        Frame fr;
+                        fr.frame_id = static_cast<int>(i);
+                        // used=false, owner_pid=-1, page_index=-1 by default
+                        g_frames.push_back(fr);
+                    }
+                }
+            }
+
+            cout << "Physical memory configured with " << num_frames
+                 << " frame(s) of " << g_config.mem_per_frame << " bytes each "
+                 << "(" << g_config.max_overall_mem << " bytes total).\n";
+        }
+        
+        // MCO2: reset backing store file
+        backing_store_reset();
+        cout << "Backing store file \"" << BACKING_STORE_FILE << "\" reset.\n";
         
         // launch cpu threads
         cout << "Launching " << g_config.num_cpu << " CPU cores...\n";
@@ -670,6 +1005,12 @@ void command_interpreter_thread(string input) {
         	proc.start_time = std::chrono::steady_clock::now();
         	proc.running = false;
         	proc.program = make_default_program(pname);
+        	// MCO2: default memory config for this process
+    		proc.mem_bytes = g_config.min_mem_per_proc;
+    		long page_size = g_config.mem_per_frame;
+    		if (page_size <= 0) page_size = 1;
+    		proc.num_pages = static_cast<int>((proc.mem_bytes + page_size - 1) / page_size);
+    		proc.page_table.assign(proc.num_pages, PageEntry{});
             int new_pid = proc.pid; // Store PID
 
         	{
@@ -749,6 +1090,101 @@ void command_interpreter_thread(string input) {
         // Print report and save to csopesy-log.txt
         report_utilization("csopesy-log.txt");
     }
+    else if (cmd == "process-smi") {
+
+    // ----- compute memory usage from frames -----
+    long total_mem   = g_config.max_overall_mem;
+    long frame_size  = g_config.mem_per_frame;
+    long used_frames = 0;
+
+    {
+        std::lock_guard<std::mutex> lk(g_frames_mtx);
+        for (const auto &fr : g_frames) {
+            if (fr.used) {
+                ++used_frames;
+            }
+        }
+    }
+
+    long used_mem = used_frames * frame_size;
+    long free_mem = total_mem - used_mem;
+    if (free_mem < 0) free_mem = 0;
+
+    cout << "==================== PROCESS-SMI ====================\n";
+    cout << "System Memory Summary\n";
+    cout << "-----------------------------------------------------\n";
+    cout << "Total Memory:        " << total_mem   << " bytes\n";
+    cout << "Used Memory:         " << used_mem    << " bytes\n";
+    cout << "Free Memory:         " << free_mem    << " bytes\n";
+    cout << "\nRunning Processes:\n";
+
+    {
+        std::lock_guard<std::mutex> lk(g_processes_mtx);
+        if (g_processes.empty()) {
+            cout << "  (No running processes)\n";
+        } else {
+            for (auto &p : g_processes) {
+            	int pages_in_ram = 0;
+            	int pages_swapped = 0;
+            	for (const auto &pe : p.page_table) {
+                	if (pe.present) {
+                    	pages_in_ram++;
+                	} else if (pe.in_backing_store) {
+                    	pages_swapped++;
+                	}
+            	}
+
+            	cout << "PID " << p.pid
+                 	<< " | Name: " << p.name
+                 	<< " | Mem: " << p.mem_bytes << " bytes"
+                 	<< " | Pages in RAM: " << pages_in_ram
+                 	<< " | Pages swapped: " << pages_swapped << "\n";
+        	}
+
+        }
+    }
+    cout << "=====================================================\n";
+	}
+    else if (cmd == "vmstat") {
+
+    // ----- compute memory usage from frames -----
+    long total_mem   = g_config.max_overall_mem;
+    long frame_size  = g_config.mem_per_frame;
+    long used_frames = 0;
+
+    {
+        std::lock_guard<std::mutex> lk(g_frames_mtx);
+        for (const auto &fr : g_frames) {
+            if (fr.used) {
+                ++used_frames;
+            }
+        }
+    }
+
+    long used_mem = used_frames * frame_size;
+    long free_mem = total_mem - used_mem;
+    if (free_mem < 0) free_mem = 0;
+
+    long idle_ticks   = g_idle_cpu_ticks.load();
+    long active_ticks = g_active_cpu_ticks.load();
+    long total_ticks  = g_cpu_cycles.load(); // existing global system clock
+
+    long paged_in  = g_pages_paged_in.load();
+    long paged_out = g_pages_paged_out.load();
+
+    cout << "========================= VMSTAT =========================\n";
+    cout << "Memory Report\n";
+    cout << "----------------------------------------------------------\n";
+    cout << "Total Memory:        " << total_mem   << " bytes\n";
+    cout << "Used Memory:         " << used_mem    << " bytes\n";
+    cout << "Free Memory:         " << free_mem    << " bytes\n";
+    cout << "Idle CPU ticks:      " << idle_ticks   << "\n";
+    cout << "Active CPU ticks:    " << active_ticks << "\n";
+    cout << "Total CPU ticks:     " << total_ticks  << "\n";
+    cout << "Pages paged in:      " << paged_in     << "\n";
+    cout << "Pages paged out:     " << paged_out    << "\n";
+    cout << "==========================================================\n";
+	}
     else {
         cout << "Unknown command. Type \"help\".\n";
     }
