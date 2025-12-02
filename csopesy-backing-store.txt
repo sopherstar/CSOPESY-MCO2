@@ -1,2 +1,0 @@
-# CSOPESY backing store
-# Each page entry will be written by the paging system.
