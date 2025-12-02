@@ -633,8 +633,17 @@ static std::vector<Instruction> make_default_program(const std::string& pname) {
 
     // Add a small WRITE then READ sequence so generated processes exercise memory ops
     Instruction decl_mem; decl_mem.type = InstrType::DECLARE; decl_mem.var = "memv"; decl_mem.value = 0; prog.push_back(decl_mem);
-    Instruction wr1; wr1.type = InstrType::WRITE; wr1.write_addr_str = "0x0"; wr1.write_value = 42; prog.push_back(wr1);
-    Instruction rd1; rd1.type = InstrType::READ; rd1.read_addr_str = "0x0"; rd1.read_target_var = "memv"; prog.push_back(rd1);
+    Instruction wr1; 
+    wr1.type = InstrType::WRITE; 
+    wr1.lit2 = 0; // Address 0
+    wr1.write_value = 42; 
+    prog.push_back(wr1);
+
+    Instruction rd1; 
+    rd1.type = InstrType::READ; 
+    rd1.lit2 = 0; // Address 0
+    rd1.read_target_var = "memv"; 
+    prog.push_back(rd1);
 
     Instruction loop; loop.type = InstrType::FOR_; loop.repeats = 3;
 
@@ -981,10 +990,16 @@ ExecStatus execute_instruction(PseudoProcess& p, Instruction& instr) {
             // handled by core function
             break;
         case InstrType::READ: {
-            // READ (var, memory_address)
-            long addr = parse_hex_address(instr.read_addr_str);
+            // [FIX] Use lit2 directly (populated by randomizer)
+            long addr = instr.lit2; 
+            
+            // Compatibility: If lit2 is 0 but we have a string (legacy code), parse the string
+            if (instr.read_addr_str.length() > 0) {
+                 addr = parse_hex_address(instr.read_addr_str);
+            }
+
             if (addr < 0) {
-                std::cout << "Process " << p.pid << ": invalid read address '" << instr.read_addr_str << "'. Terminating process.\n";
+                std::cout << "Process " << p.pid << ": invalid read address. Terminating process.\n";
                 p.finished = true;
                 return ExecStatus::FINISHED;
             }
@@ -992,7 +1007,8 @@ ExecStatus execute_instruction(PseudoProcess& p, Instruction& instr) {
             uint16_t val = 0;
             std::string err;
             if (!read_u16_at(p, addr, val, err)) {
-                std::cout << "Process " << p.pid << ": memory access violation at address " << instr.read_addr_str << ": " << err << "\n";
+                // Only print if it's a real violation, not just a clean shutdown
+                std::cout << "Process " << p.pid << ": memory access violation at address 0x" << std::hex << addr << std::dec << ": " << err << "\n";
                 p.finished = true;
                 return ExecStatus::FINISHED;
             }
@@ -1001,18 +1017,25 @@ ExecStatus execute_instruction(PseudoProcess& p, Instruction& instr) {
             p.mem[instr.read_target_var] = val;
             break;
         }
+
         case InstrType::WRITE: {
-            // WRITE (memory_address, value)
-            long addr = parse_hex_address(instr.write_addr_str);
+            // [FIX] Use lit2 directly (populated by randomizer)
+            long addr = instr.lit2;
+
+            // Compatibility: If lit2 is 0 but we have a string (legacy code), parse the string
+            if (instr.write_addr_str.length() > 0) {
+                 addr = parse_hex_address(instr.write_addr_str);
+            }
+
             if (addr < 0) {
-                std::cout << "Process " << p.pid << ": invalid write address '" << instr.write_addr_str << "'. Terminating process.\n";
+                std::cout << "Process " << p.pid << ": invalid write address. Terminating process.\n";
                 p.finished = true;
                 return ExecStatus::FINISHED;
             }
 
             std::string err;
             if (!write_u16_at(p, addr, instr.write_value, err)) {
-                std::cout << "Process " << p.pid << ": memory access violation at address " << instr.write_addr_str << ": " << err << "\n";
+                 std::cout << "Process " << p.pid << ": memory access violation at address 0x" << std::hex << addr << std::dec << ": " << err << "\n";
                 p.finished = true;
                 return ExecStatus::FINISHED;
             }

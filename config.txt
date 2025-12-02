@@ -4,8 +4,8 @@ quantum-cycles 5
 batch-process-freq 1
 min-ins 5000
 max-ins 5000
-delay-per-exec 3
-max-overall-mem 65536
+delay-per-exec 4
+max-overall-mem 4096
 mem-per-frame 64
-min-mem-per-proc 64
-max-mem-per-proc 65536
+min-mem-per-proc 128
+max-mem-per-proc 512
