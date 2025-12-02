@@ -929,28 +929,23 @@ ExecStatus execute_instruction(PseudoProcess& p, Instruction& instr) {
         }
 
         case InstrType::DECLARE: {
-            // [Requirement] Symbol table constraint: Max 32 variables
-            if (p.mem.size() >= 32) {
-                // Limit reached, ignore declaration (or log warning)
-                // p.log.push_back("Warning: Symbol table full, ignoring declaration.");
-                break; 
+            // Only declare if variable is new and symbol table has space
+            if (p.mem.find(instr.var) == p.mem.end()) {
+                if (p.mem.size() >= 32) {
+                    p.log.push_back("Warning: Symbol table full, ignoring declaration.");
+                    break;
+                }
             }
 
-            // [Requirement] Variable declaration requires symbol table memory (Page 0)
-            // We simulate this by accessing address 0.
+            // Symbol table memory is simulated as Page 0 access
             std::string err;
             if (!validate_address_only(p, 0, err)) {
-                // If Page 0 is not in RAM, this triggers a crash/page fault failure
-                // In a real OS, this would pause execution until paged in.
-                // Since our 'validate' helper currently triggers the fault logic,
-                // we just check if it succeeded.
                 p.crashed = true;
                 p.crash_error_msg = "Page fault on symbol table access: " + err;
-                // If validate_address_only returned false, it means it couldn't load the page
-                // (e.g. swap full or replacement failed), so we stop.
                 break;
             }
 
+            // Declare or update the variable
             p.mem[instr.var] = instr.value;
             break;
         }
