@@ -26,7 +26,7 @@ Input a command from the list of available commands:
 
 "screen -r " re=attaches to a running process
 
-"screen -ls: lists all running processes
+"screen -ls" lists all running processes
 
 "scheduler-start" start the scheduler which continously generates a batch of dummy process for the CPU scheduler
 
