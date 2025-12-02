@@ -17,6 +17,7 @@ using namespace std;
 #include <iomanip>
 #include <algorithm>
 
+
 // default configuration settings, loaded from config.txt
 struct Config {
     int num_cpu = 4;
@@ -47,7 +48,7 @@ struct Frame {
     int page_index{-1};   // which virtual page of that process (-1 = none)
 };
 
-enum class InstrType { PRINT, DECLARE, ADD, SUBTRACT, SLEEP, FOR_ };
+enum class InstrType { PRINT, DECLARE, ADD, SUBTRACT, SLEEP, FOR_, READ, WRITE };
 
 struct Instruction {
     InstrType type{};
@@ -62,7 +63,7 @@ struct Instruction {
     std::string var1, var2, var3; // allow var or literal in var2/var3
     bool var2_is_literal{false};
     bool var3_is_literal{false};
-    uint16_t lit2{0}, lit3{0};
+    uint32_t lit2{0}, lit3{0}; // Changed to 32-bit to support large addresses
 
     // For SLEEP
     uint8_t sleep_ticks{0};
@@ -101,6 +102,13 @@ struct PseudoProcess {
     long mem_bytes{0};                 // total virtual memory size for this process (bytes)
     int num_pages{0};                  // number of pages = ceil(mem_bytes / mem_per_frame)
     std::vector<PageEntry> page_table; // one entry per virtual page
+
+    // --- REQUIREMENT 7 ADDITIONS: Crash Tracking ---
+    bool crashed{false};               // Did the process crash?
+    std::string crash_error_msg;       // The error message
+    long crash_addr{0};                // The address that caused the crash
+    std::string crash_time_str;        // Human readable time of crash
+    // -----------------------------------------------
 
     // Stack for FOR loops
     struct LoopFrame {
@@ -377,12 +385,51 @@ std::mutex key_buffer_mutex;    //TO-DO : do we need this
 std::atomic<bool> is_running{true};
 
 //HELPER FUNCTION
+// Helper: Get current time as string HH:MM:SS
+std::string get_current_time_str() {
+    auto now = std::chrono::system_clock::now();
+    std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+    std::tm bt{};
+    #if defined(_WIN32) || defined(_WIN64)
+        localtime_s(&bt, &now_time); 
+    #else
+        localtime_r(&now_time, &bt);
+    #endif
+    std::ostringstream oss;
+    oss << std::put_time(&bt, "%H:%M:%S");
+    return oss.str();
+}
+
+// HELPER FUNCTION (UPDATED)
+// Handles "quoted strings" and escaped quotes \" correctly
 vector<string> tokenize_input(const string& input) {
     vector<string> tokens;
-    istringstream iss(input);
-    string token;
-    while (iss >> token) {
-        tokens.push_back(token);
+    string current_token;
+    bool in_quotes = false;
+
+    for (size_t i = 0; i < input.length(); ++i) {
+        char c = input[i];
+
+        // Handle escaped quote \" -> treat as literal "
+        if (c == '\\' && i + 1 < input.length() && input[i + 1] == '"') {
+            current_token += '"'; // Add " as a literal character
+            i++; // Skip the next char (the quote)
+        }
+        else if (c == '"') {
+            in_quotes = !in_quotes; // Toggle quote state
+        } 
+        else if (c == ' ' && !in_quotes) {
+            if (!current_token.empty()) {
+                tokens.push_back(current_token);
+                current_token.clear();
+            }
+        } 
+        else {
+            current_token += c;
+        }
+    }
+    if (!current_token.empty()) {
+        tokens.push_back(current_token);
     }
     return tokens;
 }
@@ -424,6 +471,83 @@ static uint16_t read_val(PseudoProcess& p, const std::string& name, bool is_lit,
 static long long uptime_ms(const PseudoProcess& pr) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - pr.start_time).count();
+}
+
+// [Requirement 6] Parse a single instruction string line (e.g. "DECLARE a 5")
+Instruction parse_line(const std::string& line) {
+    Instruction instr;
+    std::stringstream ss(line);
+    std::string type_str;
+    ss >> type_str;
+
+    if (type_str == "DECLARE") {
+        instr.type = InstrType::DECLARE;
+        ss >> instr.var >> instr.value;
+    }
+    else if (type_str == "PRINT") {
+        instr.type = InstrType::PRINT;
+        size_t start = line.find("PRINT") + 5;
+        if (start < line.size()) {
+            std::string content = line.substr(start);
+            size_t first = content.find_first_not_of(" (");
+            size_t last = content.find_last_not_of(" )");
+            if(first != std::string::npos) 
+                instr.msg = content.substr(first, (last - first + 1));
+        }
+    }
+    else if (type_str == "ADD") {
+        instr.type = InstrType::ADD;
+        std::string v2, v3;
+        ss >> instr.var1 >> v2 >> v3;
+        if (isdigit(v2[0])) { instr.var2_is_literal = true; instr.lit2 = stoi(v2); }
+        else { instr.var2 = v2; }
+        if (isdigit(v3[0])) { instr.var3_is_literal = true; instr.lit3 = stoi(v3); }
+        else { instr.var3 = v3; }
+    }
+    else if (type_str == "SUBTRACT") {
+        instr.type = InstrType::SUBTRACT;
+        std::string v2, v3;
+        ss >> instr.var1 >> v2 >> v3;
+        if (isdigit(v2[0])) { instr.var2_is_literal = true; instr.lit2 = stoi(v2); }
+        else { instr.var2 = v2; }
+        if (isdigit(v3[0])) { instr.var3_is_literal = true; instr.lit3 = stoi(v3); }
+        else { instr.var3 = v3; }
+    }
+    else if (type_str == "WRITE") {
+        instr.type = InstrType::WRITE;
+        std::string addr_str, val_str;
+        ss >> addr_str >> val_str;
+        instr.lit2 = std::stoul(addr_str, nullptr, 16); 
+        if (isdigit(val_str[0])) { 
+            instr.var3_is_literal = true; 
+            instr.lit3 = stoi(val_str); 
+        } else {
+            instr.var1 = val_str; 
+        }
+    }
+    else if (type_str == "READ") {
+        instr.type = InstrType::READ;
+        std::string addr_str;
+        ss >> instr.var >> addr_str;
+        instr.lit2 = std::stoul(addr_str, nullptr, 16); 
+    }
+    
+    return instr;
+}
+
+// [Requirement 6] Parse the full semi-colon separated string
+std::vector<Instruction> parse_custom_program(const std::string& script) {
+    std::vector<Instruction> prog;
+    std::stringstream ss(script);
+    std::string segment;
+
+    while (std::getline(ss, segment, ';')) {
+        size_t first = segment.find_first_not_of(" ");
+        if (first == std::string::npos) continue; 
+        std::string clean_line = segment.substr(first);
+        prog.push_back(parse_line(clean_line));
+    }
+    return prog;
 }
 
 static std::vector<Instruction> make_default_program(const std::string& pname) {
@@ -751,6 +875,30 @@ void cpu_core_function(int core_id) {
 
             // execute instruction
             ExecStatus status = execute_instruction(*p, *instr_to_exec);
+            // [CHANGE 7] PASTE VIOLATION CHECK HERE
+            // Check for memory violations (Simulated for Requirement 7)
+            if (instr_to_exec->type == InstrType::WRITE || instr_to_exec->type == InstrType::READ) {
+                long target_addr = instr_to_exec->lit2; 
+                std::string err;
+                
+                // Use your existing validator to check if address is valid
+                if (!validate_address_only(*p, target_addr, err)) {
+                    // CRASH THE PROCESS
+                    p->crashed = true;
+                    p->crash_time_str = get_current_time_str();
+                    p->crash_addr = target_addr;
+                    p->finished = true; 
+                    p->running = false;
+                    process_finished = true; // Stop execution immediately
+                    
+                    // Optional: Add to log for process-smi
+                    p->log.push_back("Start time: " + p->crash_time_str);
+                    p->log.push_back("Crash: Memory violation at 0x" + std::to_string(target_addr));
+                    break; 
+                }
+            }
+            // [END CHANGE 7]
+
             if (status == ExecStatus::SLEEP) {
                 process_sleeping = true;
                 break;
@@ -1079,31 +1227,95 @@ void command_interpreter_thread(string input) {
         	return;
     	}
 
-        if (tokens[1] == "-r") {
-            if (tokens.size() < 3) {
-                cout << "Error: missing <process name>.\n";
+// [Requirement 6] screen -c implementation
+        if (tokens[1] == "-c") {
+            if (tokens.size() < 5) { // Needs: screen -c <name> <size> <instruction>
+                cout << "Error: Usage: screen -c <name> <mem_size> \"<instructions>\"\n";
                 return;
             }
+            
+            string pname = tokens[2];
+            long mem_size = 0;
+             try {
+                mem_size = std::stol(tokens[3]);
+            } catch (...) { cout << "Invalid size.\n"; return; }
 
-            std::ostringstream oss;
-        	for (size_t i = 2; i < tokens.size(); ++i) {
-            	if (i > 2) oss << ' ';
-            	oss << tokens[i];
-        	}
-        	std::string pname = oss.str();
+            string instruction_script = tokens[4]; 
+
+            PseudoProcess proc;
+            proc.pid = g_next_pid++;
+            proc.name = pname;
+            proc.start_time = std::chrono::steady_clock::now();
+            proc.running = false;
+            
+            proc.mem_bytes = mem_size;
+            long page_size = g_config.mem_per_frame;
+            if (page_size <= 0) page_size = 1;
+            proc.num_pages = static_cast<int>((proc.mem_bytes + page_size - 1) / page_size);
+            proc.page_table.assign(proc.num_pages, PageEntry{});
+
+            // Load Custom Instructions
+            proc.program = parse_custom_program(instruction_script);
+
+            int new_pid = proc.pid;
+            {
+                std::lock_guard<std::mutex> lk(g_processes_mtx);
+                g_processes.push_back(std::move(proc));
+            }
+            {
+                std::lock_guard<std::mutex> lk(g_ready_queue_mtx);
+                g_ready_queue.push(new_pid);
+            }
+            cout << "Custom process \"" << pname << "\" created with PID " << new_pid << ".\n";
+
+            cout << "Attaching to process...\n";
+            g_attached_pid = new_pid; 
+            clear_screen();
+            
+            return;
+        }
+
+        // [Requirement 7] screen -r Update for Violation Errors
+        if (tokens[1] == "-r") {
+             if (tokens.size() < 3) { cout << "Error: missing <process name>.\n"; return; }
+             
+             std::string pname;
+             // Combine tokens in case name has spaces (though your tokenizer handles quotes now)
+             std::ostringstream oss;
+             for (size_t i = 2; i < tokens.size(); ++i) {
+                if (i > 2) oss << ' ';
+                oss << tokens[i];
+             }
+             pname = oss.str();
 
             int pid_to_attach = -1;
+            bool is_crashed = false;
+            long crash_addr = 0;
+            std::string crash_time;
+
             {
                 std::lock_guard<std::mutex> lk(g_processes_mtx);
                 for (auto& p : g_processes) {
-                    if (p.name == pname && !p.finished) {
-                        pid_to_attach = p.pid;
+                    if (p.name == pname) {
+                        if (p.crashed) {
+                            is_crashed = true;
+                            crash_addr = p.crash_addr;
+                            crash_time = p.crash_time_str;
+                            break;
+                        }
+                        if (!p.finished) {
+                            pid_to_attach = p.pid;
+                        }
                         break;
                     }
                 }
             }
 
-            if (pid_to_attach != -1) {
+            if (is_crashed) {
+                cout << "Process " << pname << " shut down due to memory access violation error that occurred at " 
+                     << crash_time << ".\n0x" << std::hex << crash_addr << std::dec << " invalid.\n";
+            } 
+            else if (pid_to_attach != -1) {
                 g_attached_pid = pid_to_attach;
                 clear_screen();
                 cout << "Re-attached to process " << pname << ".\n";
