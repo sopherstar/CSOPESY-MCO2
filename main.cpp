@@ -49,7 +49,7 @@ struct Frame {
     int page_index{-1};   // which virtual page of that process (-1 = none)
 };
 
-enum class InstrType { PRINT, DECLARE, ADD, SUBTRACT, SLEEP, FOR_, READ, WRITE };
+enum class InstrType { PRINT, DECLARE, ADD, SUBTRACT, SLEEP, FOR_, READ, WRITE};
 
 struct Instruction {
     InstrType type{};
@@ -72,6 +72,15 @@ struct Instruction {
     // For FOR
     std::vector<Instruction> body;
     uint32_t repeats{0};
+
+    // For READ
+    std::string read_target_var;
+    std::string read_addr_str;
+
+    //FOR WRITE
+    std::string write_addr_str;
+    uint16_t write_value{0};
+
 };
 
 // =======================
@@ -94,6 +103,7 @@ struct PseudoProcess {
     uint8_t sleep_left{0};
     std::vector<Instruction> program;
     std::unordered_map<std::string, uint16_t> mem; // logical variables
+    std::unordered_map<long, uint16_t> ram16; // address -> value
 
     std::vector<std::string> log; // For PRINT instruction
 
@@ -123,6 +133,9 @@ struct PseudoProcess {
 // All physical frames
 std::vector<Frame> g_frames;
 std::mutex g_frames_mtx;
+
+// Physical frame contents: each frame stores `mem_per_frame` bytes
+std::vector<std::vector<uint8_t>> g_frame_data;
 
 std::queue<int> g_frame_fifo;   // frame ids used in allocation order (for FIFO replacement)
 
@@ -169,9 +182,17 @@ void backing_store_write_page_entry(int pid, int page_index) {
     }
 }
 
-// =======================
-// MCO2: Demand paging core
-// =======================
+// MCO2: Demand paging
+
+// hex address to a long int
+static long parse_hex_address(const std::string& s) {
+    try {
+        return std::stol(s, nullptr, 16);
+    } catch (...) {
+        return -1;
+    }
+}
+
 
 // Convert a byte address (within a process) to a virtual page index.
 int address_to_page_index(long addr) {
@@ -378,6 +399,60 @@ bool translate_address(PseudoProcess& proc, long addr, int& frame_id, long& offs
     return true;
 }
 
+// Read a uint16_t value at the given virtual byte address (little-endian).
+// Handles page loads and page-crossing reads by translating each byte separately.
+bool read_u16_at(PseudoProcess& proc, long addr, uint16_t& out_val, std::string& err) {
+    int f0 = -1, f1 = -1;
+    long o0 = -1, o1 = -1;
+    if (!translate_address(proc, addr, f0, o0, err)) return false;
+    if (!translate_address(proc, addr + 1, f1, o1, err)) return false;
+
+    std::lock_guard<std::mutex> lk(g_frames_mtx);
+    if (f0 < 0 || f0 >= static_cast<int>(g_frame_data.size()) ||
+        f1 < 0 || f1 >= static_cast<int>(g_frame_data.size())) {
+        err = "Invalid frame id while reading memory.";
+        return false;
+    }
+
+    long frame_sz = g_config.mem_per_frame;
+    if (o0 < 0 || o0 >= frame_sz || o1 < 0 || o1 >= frame_sz) {
+        err = "Invalid offset while reading memory.";
+        return false;
+    }
+
+    uint8_t b0 = g_frame_data[f0][o0];
+    uint8_t b1 = g_frame_data[f1][o1];
+    out_val = static_cast<uint16_t>(b0) | (static_cast<uint16_t>(b1) << 8);
+    return true;
+}
+
+// Write a uint16_t value at the given virtual byte address (little-endian).
+bool write_u16_at(PseudoProcess& proc, long addr, uint16_t val, std::string& err) {
+    int f0 = -1, f1 = -1;
+    long o0 = -1, o1 = -1;
+    if (!translate_address(proc, addr, f0, o0, err)) return false;
+    if (!translate_address(proc, addr + 1, f1, o1, err)) return false;
+
+    std::lock_guard<std::mutex> lk(g_frames_mtx);
+    if (f0 < 0 || f0 >= static_cast<int>(g_frame_data.size()) ||
+        f1 < 0 || f1 >= static_cast<int>(g_frame_data.size())) {
+        err = "Invalid frame id while writing memory.";
+        return false;
+    }
+
+    long frame_sz = g_config.mem_per_frame;
+    if (o0 < 0 || o0 >= frame_sz || o1 < 0 || o1 >= frame_sz) {
+        err = "Invalid offset while writing memory.";
+        return false;
+    }
+
+    uint8_t b0 = static_cast<uint8_t>(val & 0xFF);
+    uint8_t b1 = static_cast<uint8_t>((val >> 8) & 0xFF);
+    g_frame_data[f0][o0] = b0;
+    g_frame_data[f1][o1] = b1;
+    return true;
+}
+
 // shared state
 bool is_initialized = false;
 size_t display_width = 100;         //TO-DO : do we need this
@@ -555,6 +630,11 @@ static std::vector<Instruction> make_default_program(const std::string& pname) {
     std::vector<Instruction> prog;
 
     Instruction d; d.type = InstrType::DECLARE; d.var = "x"; d.value = 0; prog.push_back(d);
+
+    // Add a small WRITE then READ sequence so generated processes exercise memory ops
+    Instruction decl_mem; decl_mem.type = InstrType::DECLARE; decl_mem.var = "memv"; decl_mem.value = 0; prog.push_back(decl_mem);
+    Instruction wr1; wr1.type = InstrType::WRITE; wr1.write_addr_str = "0x0"; wr1.write_value = 42; prog.push_back(wr1);
+    Instruction rd1; rd1.type = InstrType::READ; rd1.read_addr_str = "0x0"; rd1.read_target_var = "memv"; prog.push_back(rd1);
 
     Instruction loop; loop.type = InstrType::FOR_; loop.repeats = 3;
 
@@ -900,6 +980,44 @@ ExecStatus execute_instruction(PseudoProcess& p, Instruction& instr) {
         case InstrType::FOR_:
             // handled by core function
             break;
+        case InstrType::READ: {
+            // READ (var, memory_address)
+            long addr = parse_hex_address(instr.read_addr_str);
+            if (addr < 0) {
+                std::cout << "Process " << p.pid << ": invalid read address '" << instr.read_addr_str << "'. Terminating process.\n";
+                p.finished = true;
+                return ExecStatus::FINISHED;
+            }
+
+            uint16_t val = 0;
+            std::string err;
+            if (!read_u16_at(p, addr, val, err)) {
+                std::cout << "Process " << p.pid << ": memory access violation at address " << instr.read_addr_str << ": " << err << "\n";
+                p.finished = true;
+                return ExecStatus::FINISHED;
+            }
+
+            // Auto-declare and store
+            p.mem[instr.read_target_var] = val;
+            break;
+        }
+        case InstrType::WRITE: {
+            // WRITE (memory_address, value)
+            long addr = parse_hex_address(instr.write_addr_str);
+            if (addr < 0) {
+                std::cout << "Process " << p.pid << ": invalid write address '" << instr.write_addr_str << "'. Terminating process.\n";
+                p.finished = true;
+                return ExecStatus::FINISHED;
+            }
+
+            std::string err;
+            if (!write_u16_at(p, addr, instr.write_value, err)) {
+                std::cout << "Process " << p.pid << ": memory access violation at address " << instr.write_addr_str << ": " << err << "\n";
+                p.finished = true;
+                return ExecStatus::FINISHED;
+            }
+            break;
+        }
     }
     return ExecStatus::OK;
 }
@@ -1039,6 +1157,8 @@ void cpu_core_function(int core_id) {
         }
     }
 }
+
+
 
 // Command interpreter
 void command_interpreter_thread(string input) {
@@ -1201,11 +1321,15 @@ void command_interpreter_thread(string input) {
                 g_frames.clear();
                 if (num_frames > 0) {
                     g_frames.reserve(num_frames);
+                    g_frame_data.clear();
+                    g_frame_data.resize(static_cast<size_t>(num_frames));
                     for (long i = 0; i < num_frames; ++i) {
                         Frame fr;
                         fr.frame_id = static_cast<int>(i);
                         // used=false, owner_pid=-1, page_index=-1 by default
                         g_frames.push_back(fr);
+                        // initialize frame bytes to zero
+                        g_frame_data[static_cast<size_t>(i)].assign(static_cast<size_t>(g_config.mem_per_frame), 0);
                     }
                 }
             }
