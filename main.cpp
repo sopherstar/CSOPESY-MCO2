@@ -16,6 +16,7 @@ using namespace std;
 #include <fstream>
 #include <iomanip>
 #include <algorithm>
+#include <random>
 
 
 // default configuration settings, loaded from config.txt
@@ -577,6 +578,83 @@ static std::vector<Instruction> make_default_program(const std::string& pname) {
 
 //screen marquee logic TO-DO: create this
 
+// --- SCHEDULER RANDOMIZATION HELPERS ---
+
+// Helper for random integers
+int rand_int(int min, int max) {
+    static std::mt19937 rng(std::random_device{}());
+    std::uniform_int_distribution<int> dist(min, max);
+    return dist(rng);
+}
+
+// Generate a random instruction
+Instruction make_random_instruction(long max_mem) {
+    Instruction instr;
+    // 0=PRINT, 1=DECLARE, 2=ADD, 3=SUB, 4=SLEEP, 5=WRITE, 6=READ
+    // We weight them slightly to make sure we get enough memory ops
+    int type_idx = rand_int(0, 8); 
+    
+    // Map random index to type
+    if (type_idx == 0) instr.type = InstrType::PRINT;
+    else if (type_idx == 1) instr.type = InstrType::DECLARE;
+    else if (type_idx == 2) instr.type = InstrType::ADD;
+    else if (type_idx == 3) instr.type = InstrType::SUBTRACT;
+    else if (type_idx == 4) instr.type = InstrType::SLEEP;
+    else if (type_idx == 5 || type_idx == 7) instr.type = InstrType::WRITE; // Higher chance
+    else if (type_idx == 6 || type_idx == 8) instr.type = InstrType::READ;  // Higher chance
+
+    switch (instr.type) {
+        case InstrType::PRINT:
+            instr.msg = "Auto-generated message";
+            break;
+        case InstrType::DECLARE:
+            instr.var = "v" + std::to_string(rand_int(1, 5)); // v1..v5
+            instr.value = rand_int(1, 100);
+            break;
+        case InstrType::ADD:
+        case InstrType::SUBTRACT:
+            instr.var1 = "v" + std::to_string(rand_int(1, 5));
+            instr.var2 = "v" + std::to_string(rand_int(1, 5));
+            instr.var3_is_literal = true; 
+            instr.lit3 = rand_int(1, 10);
+            break;
+        case InstrType::SLEEP:
+            instr.sleep_ticks = rand_int(1, 5);
+            break;
+        case InstrType::WRITE: {
+            // Write to a random address within the process memory limit
+            // We align to 4 bytes just to be clean, though not strictly required
+            long rand_addr = rand_int(0, (max_mem > 0 ? max_mem - 1 : 0));
+            instr.lit2 = rand_addr; 
+            instr.var3_is_literal = true;
+            instr.lit3 = rand_int(0, 255); // Write random value
+            break;
+        }
+        case InstrType::READ: {
+            instr.var = "v" + std::to_string(rand_int(1, 5));
+            long rand_addr = rand_int(0, (max_mem > 0 ? max_mem - 1 : 0));
+            instr.lit2 = rand_addr;
+            break;
+        }
+        case InstrType::FOR_: break; // We skip FOR generation for simplicity in this randomizer
+    }
+    return instr;
+}
+
+std::vector<Instruction> make_random_program(long mem_size) {
+    std::vector<Instruction> prog;
+    long num_ins = rand_int(g_config.min_ins, g_config.max_ins);
+    
+    // Always start with a Declaration so we have a variable to use
+    Instruction d; d.type = InstrType::DECLARE; d.var = "v1"; d.value = 0;
+    prog.push_back(d);
+
+    for (int i = 0; i < num_ins; ++i) {
+        prog.push_back(make_random_instruction(mem_size));
+    }
+    return prog;
+}
+
 // Scheduler Start
 void scheduler_start() {
     scheduler_generating = true;
@@ -607,6 +685,7 @@ void scheduler_start() {
             int active_total = running_count + ready_count;
 
             // Only generate if fewer than num_cpu active processes
+            // Only generate if fewer than num_cpu active processes
             if (active_total < g_config.num_cpu) {
                 int to_generate = g_config.num_cpu - active_total;
                 for (int i = 0; i < to_generate; ++i) {
@@ -623,14 +702,30 @@ void scheduler_start() {
                     proc.name = pname_ss.str();
                     proc.start_time = std::chrono::steady_clock::now();
                     proc.running = false;
-                    proc.program = make_default_program(proc.name);
+
+                    // [CHANGE] Randomize memory size FIRST
+                    // Calculate power of 2 size between min and max
+                    // Simple approach: pick a size, then verify validity or just pick standard sizes
+                    // For simplicity, we pick either min, max, or something in between
+                    long mem_opts[] = {64, 256, 1024, 4096, 16384};
+                    int m_idx = rand_int(0, 4);
+                    long chosen_mem = mem_opts[m_idx];
                     
-                    // MCO2: default memory config for auto-generated process
-        			proc.mem_bytes = g_config.min_mem_per_proc;
-        			long page_size = g_config.mem_per_frame;
-        			if (page_size <= 0) page_size = 1;
-        			proc.num_pages = static_cast<int>((proc.mem_bytes + page_size - 1) / page_size);
-        			proc.page_table.assign(proc.num_pages, PageEntry{});
+                    // Clamp to config limits
+                    if (chosen_mem < g_config.min_mem_per_proc) chosen_mem = g_config.min_mem_per_proc;
+                    if (chosen_mem > g_config.max_mem_per_proc) chosen_mem = g_config.max_mem_per_proc;
+
+                    proc.mem_bytes = chosen_mem;
+
+                    // [CHANGE] Use Random Program Generator
+                    // We pass chosen_mem so it generates addresses within bounds
+                    proc.program = make_random_program(proc.mem_bytes);
+                    
+                    // Setup Pages
+                    long page_size = g_config.mem_per_frame;
+                    if (page_size <= 0) page_size = 1;
+                    proc.num_pages = static_cast<int>((proc.mem_bytes + page_size - 1) / page_size);
+                    proc.page_table.assign(proc.num_pages, PageEntry{});
 
                     {
                         std::lock_guard<std::mutex> lk(g_processes_mtx);
@@ -641,8 +736,9 @@ void scheduler_start() {
                         std::lock_guard<std::mutex> lk(g_ready_queue_mtx);
                         g_ready_queue.push(g_next_pid - 1);
                     }
-
-                    // std::cout << "[scheduler] generated " << proc.name << "\n";
+                    
+                    std::cout << "[scheduler] generated " << proc.name 
+                              << " (" << proc.mem_bytes << " bytes)\n";
                 }
             }
 
@@ -752,9 +848,32 @@ ExecStatus execute_instruction(PseudoProcess& p, Instruction& instr) {
             break;
         }
 
-        case InstrType::DECLARE:
+        case InstrType::DECLARE: {
+            // [Requirement] Symbol table constraint: Max 32 variables
+            if (p.mem.size() >= 32) {
+                // Limit reached, ignore declaration (or log warning)
+                // p.log.push_back("Warning: Symbol table full, ignoring declaration.");
+                break; 
+            }
+
+            // [Requirement] Variable declaration requires symbol table memory (Page 0)
+            // We simulate this by accessing address 0.
+            std::string err;
+            if (!validate_address_only(p, 0, err)) {
+                // If Page 0 is not in RAM, this triggers a crash/page fault failure
+                // In a real OS, this would pause execution until paged in.
+                // Since our 'validate' helper currently triggers the fault logic,
+                // we just check if it succeeded.
+                p.crashed = true;
+                p.crash_error_msg = "Page fault on symbol table access: " + err;
+                // If validate_address_only returned false, it means it couldn't load the page
+                // (e.g. swap full or replacement failed), so we stop.
+                break;
+            }
+
             p.mem[instr.var] = instr.value;
             break;
+        }
 
         case InstrType::ADD: {
             uint16_t val2 = read_val(p, instr.var2, instr.var2_is_literal, instr.lit2);
