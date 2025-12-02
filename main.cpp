@@ -869,8 +869,9 @@ void report_utilization(const std::string& out_file = "") {
             cores_used++;
         }
     }
+    if (cores_used > g_config.num_cpu) cores_used = g_config.num_cpu;
+
     int cores_available = g_config.num_cpu - cores_used;
-    if (cores_available < 0) cores_available = 0; // Safety check
     
     double cpu_utilization = 0.0;
     if (g_config.num_cpu > 0) {
